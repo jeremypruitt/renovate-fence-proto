@@ -12,7 +12,7 @@
 # then remove "$dir".
 set -euo pipefail
 
-SYFT_VERSION=1.42.3
+SYFT_VERSION=1.57.0
 # From syft_1.42.3_checksums.txt on the release.
 syft_sha256() {
   case "$1" in
