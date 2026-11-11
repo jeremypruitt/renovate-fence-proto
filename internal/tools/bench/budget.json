@@ -1,0 +1,24 @@
+{
+  "parallelism": 10,
+  "max_requests_per_resource": {
+    "plan": 1.15,
+    "refresh": 1.15,
+    "apply": 5.5,
+    "destroy": 5.9
+  },
+  "max_list_reads": {
+    "10": { "plan": 1, "refresh": 1, "apply": 5, "destroy": 3 },
+    "100": { "plan": 3, "refresh": 3, "apply": 8, "destroy": 5 },
+    "500": { "plan": 11, "refresh": 11, "apply": 32, "destroy": 21 },
+    "1000": { "plan": 21, "refresh": 21, "apply": 62, "destroy": 41 }
+  },
+  "growth_reference": 100,
+  "max_growth": {
+    "plan": 2.0,
+    "refresh": 2.0
+  },
+  "max_seconds": {
+    "500": { "plan": 8, "refresh": 5, "apply": 60, "destroy": 60 },
+    "1000": { "plan": 15, "refresh": 10, "apply": 120, "destroy": 150 }
+  }
+}

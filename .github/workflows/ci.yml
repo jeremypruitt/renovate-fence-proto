@@ -1,0 +1,567 @@
+name: CI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The minimum go.mod declares, and not a preference: 1.26.10 is the first
+  # 1.26 with the crypto/x509 fix, and golang.org/x/net v0.60.0 needs 1.26.
+  GO_VERSION: "1.26.10"
+
+jobs:
+  # Keeps build and module caches from being committed.
+  tracked-ignored:
+    name: no tracked ignored files
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: check that no tracked file matches .gitignore
+        run: scripts/check-tracked-ignored.sh
+
+  # What tracked-ignored above does not cover. That job answers "is anything
+  # here already forbidden"; this one answers "has the tree grown in a way
+  # nobody meant", which is the question the 1.6 GB push would have failed
+  # first: the cache averaged 38 KB a file, so no size rule caught it and
+  # counting did.
+  #
+  # Like tracked-ignored, it needs no client checkout and no App token, so it
+  # cannot be taken down by the thing that took every other job in this
+  # repository's history down.
+  hygiene:
+    name: repo hygiene and signatures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # rev-list needs the history, and the signature check walks the range
+          # this event introduced.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: repository hygiene
+        run: ./scripts/repo-hygiene.sh
+      - name: the hygiene gates can still fail
+        run: make hygiene-test
+      - name: shell blocks in the docs paste into zsh
+        run: make doc-commands
+      - name: the doc-commands gate can still fail
+        run: make doc-commands-test
+      - name: the public-text gate can still fail
+        run: make public-text-test
+      # Needs bash, python3 and jq, and no client checkout: curl and go are
+      # shims, and the only server is on 127.0.0.1.
+      - name: the live scripts keep credentials on https and off the command line
+        run: make script-credentials-test
+      - name: the storage run cleans up and ignores KUBE_* settings
+        run: make live-storage-script-test
+      - name: a kept live run records the type and version it ended on
+        run: make live-kept-vars-test
+      - name: the helpers the scripts share
+        run: make script-lib-test
+      # shellcheck comes with the ubuntu-latest image.
+      - name: shellcheck the scripts
+        run: make shellcheck
+      - name: work out what this event added
+        id: range
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.sha }}
+        run: |
+          # A first push to a branch reports an all-zero base, and a
+          # workflow_dispatch reports none at all. Both mean "no range to
+          # compare", so check the head commit alone rather than the whole
+          # history of the repository.
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            echo "range=${HEAD}~1..${HEAD}" >> "$GITHUB_OUTPUT"
+          else
+            echo "range=${BASE}..${HEAD}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: every commit is signed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/verify-signatures.sh "${{ steps.range.outputs.range }}"
+
+  # The deny-list in .github/public-text/: ticket keys, internal links and
+  # hosts, people, home paths, deal names and AI trailers. GitHub's secret
+  # scanning can't hold custom patterns on a public repository, so this is
+  # the only gate for them.
+  # pr-text.yml runs the same rules on commit messages and pull request text.
+  public-text:
+    name: public text
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: no text that isn't for a public repository
+        run: make public-text-check
+
+  # make real-api-check runs on a local kind stack with the real API, which
+  # public CI can't reach, and commits ci/real-api/record.json. This holds
+  # every pull request to that record: the fake it vouches for and the API
+  # version it ran against have to be this tree's. TESTING.md has how to run it.
+  real-api-record:
+    name: real API record
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: the fake was last checked against the real API at this tree and API version
+        run: make real-api-record-check
+      - name: the record check can still fail
+        run: make real-api-check-test
+
+  # make real-api-check-hardware creates clusters and hosts on a landscape for
+  # hours, so CI runs it against a fake standing in for one: a run that
+  # passes, one killed while it creates, and one whose landscape goes away.
+  real-api-hardware:
+    name: real API check on hardware, against a stand-in
+    runs-on: ubuntu-latest
+    # Four runs of the walkthrough at once, about three minutes on a laptop.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1
+        with:
+          # Hardware mode refuses 1.16.0 to 1.16.4, which can empty the state
+          # file on an interrupt (hashicorp/terraform#39287).
+          terraform_version: "1.17.1"
+          terraform_wrapper: false
+      - name: hardware mode records, cleans up after a kill, and lists what it left
+        run: make real-api-check-hardware-test
+
+  # gitleaks over the tracked tree, and over every commit this event adds, so
+  # a secret added then removed inside one pull request is still caught. The
+  # CLI, pinned and checksum-checked by scripts/check-secrets.sh, not
+  # gitleaks-action, which needs a license on an organization's repositories.
+  secrets:
+    name: secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: the secrets gate can still fail
+        run: make secrets-test
+      - name: no secrets in the tracked files
+        run: make secrets-check
+      - name: no secrets in the commits this event adds
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.sha }}
+        run: |
+          # The same range as the signature check in the hygiene job. No base,
+          # or an all-zero one, means a first push or a dispatch: the tree
+          # scan above is the whole check then.
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            echo "No range for this event. The tree scan covers it."
+            exit 0
+          fi
+          ./scripts/check-secrets.sh --range "${BASE}..${HEAD}"
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: go build
+        run: make build
+      - name: cross-compile for every release platform
+        run: make cross-build
+      - name: gofmt
+        run: make fmt-check
+      - name: go vet
+        run: make vet
+      - name: provider name audit
+        run: make name-audit
+      - name: the generated API client matches its spec
+        run: make client-check
+
+  test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: go test
+        run: make test
+
+  # The acceptance suite under the two Terraform releases HashiCorp still
+  # fixes: the newest patch of the newest minor and of the minor before it.
+  # TESTING.md says when and how to move them. Each run is the same command
+  # as a local one: it records what each test did, checks
+  # docs/testing-matrix.md against it, then writes upgrade coverage to the
+  # job summary, as information.
+  testacc:
+    name: acceptance under Terraform ${{ matrix.terraform }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        terraform: ["1.16.7", "1.17.1"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The upgrade coverage summary picks the previous release from the
+          # tags, as the upgrade job does, and reads its walkthrough and state
+          # schemas from its tag. It's information: without them it says so
+          # and passes.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1
+        with:
+          terraform_version: ${{ matrix.terraform }}
+          terraform_wrapper: false
+      - name: acceptance, and the testing matrix is current
+        run: make testacc
+
+  # The same suite under OpenTofu's two newest releases, as for Terraform
+  # above, in a job of its own so its time limit is its own. It's where
+  # write-only attributes, import blocks and generated configuration meet
+  # OpenTofu. The tests OpenTofu can't run skip with a reason TESTING.md
+  # lists, so this run doesn't check the testing matrix, which is
+  # terraform's run.
+  testacc-opentofu:
+    name: acceptance under OpenTofu ${{ matrix.tofu }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        tofu: ["1.12.12", "1.13.9"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4  # v2.0.2
+        with:
+          tofu_version: ${{ matrix.tofu }}
+          tofu_wrapper: false
+      - name: acceptance under OpenTofu
+        run: make testacc TF_BIN=tofu
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a  # v9.3.0
+        with:
+          version: v2.13.2
+          args: --timeout=5m
+
+  vulncheck:
+    name: vulncheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      # Gate S6. Both modules: the provider here, tools/providerbar in the
+      # research tree, which has its own CI. It scans twice, under GO_VERSION
+      # and under the release Go in .go-release-version, because standard
+      # library advisories belong to the Go govulncheck runs under.
+      - name: reachable known vulnerabilities
+        run: make vulncheck
+
+  docs:
+    name: generated docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: .go-release-version
+          cache: true
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1
+        with:
+          terraform_version: "1.17.1"
+      - name: verify generated provider documentation
+        run: make docs-check
+
+  against-fake:
+    name: against the fake
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1
+        with:
+          terraform_version: "1.17.1"
+          terraform_wrapper: false
+      - name: plan the examples against the fake, over both tiers
+        run: make plan-fake
+
+      - name: the hardware walkthrough works as written
+        run: make walkthrough-test
+
+      - name: the curl walkthrough works as written
+        run: make walkthrough-api-test
+
+  # Its own job because the walkthrough already takes most of that job's
+  # time, and this applies the same directories again.
+  plan-quality:
+    name: plan quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1
+        with:
+          terraform_version: "1.17.1"
+          terraform_wrapper: false
+      - name: refresh-only plans find nothing, and plans stay within the unknown budget
+        run: make plan-quality
+
+  # State the previous release wrote must plan empty under this tree. The
+  # previous release is installed from the public registries, under the CLI
+  # versions the nightly pins.
+  upgrade:
+    name: upgrade from the previous release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The previous release is worked out from the tags, and its
+          # walkthrough is read from its tag.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1
+        with:
+          terraform_version: "1.17.1"
+          terraform_wrapper: false
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4  # v2.0.2
+        with:
+          tofu_version: "1.13.9"
+          tofu_wrapper: false
+      - name: state from the previous release plans empty under this tree
+        run: make upgrade-test
+
+  release-validation:
+    name: release artifact validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: verify release dispatcher configuration
+        run: make release-config-test
+      # Every job that holds a secret also runs actions from other
+      # repositories, so this keeps each of them pinned to a commit.
+      - name: verify action pins and checkout credentials
+        run: make workflow-actions-test
+      - name: verify the nightly's Terraform and OpenTofu release check
+        run: make cli-releases-check-test
+      - name: verify the release's syft is checked before it runs
+        run: make install-syft-test
+      # Nothing else runs these.
+      - name: verify the major version gate
+        run: make major-release-gate-test
+      - name: verify the release tag checks
+        run: make release-tag-validation-test
+      - name: verify the setup doctor
+        run: make doctor-script-test
+      - name: verify the signing key check
+        run: make signing-key-check-test
+      # The rehearsal takes most of this workflow's time, and a pull request
+      # that touches no release input cannot change its result. The build job
+      # still compiles every platform. Pushes and tags always rehearse.
+      - name: did this change a release input
+        id: inputs
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # The diff is taken first, so a git failure fails the step instead
+          # of reading as "nothing changed" and skipping the rehearsal.
+          rehearse=true
+          if [ -n "$BASE" ]; then
+            changed="$(git diff --name-only "$BASE" HEAD)"
+            if ! echo "$changed" |
+              grep -E '^(\.goreleaser\.yaml|\.go-release-version|terraform-registry-manifest\.json|main\.go|go\.(mod|sum|work)|\.syft\.ya?ml|Makefile|scripts/.*(release|manifest|syft).*|\.github/)' >/dev/null; then
+              rehearse=false
+            fi
+          fi
+          if [ "$rehearse" = false ]; then
+            echo "No release input changed, so the release rehearsal is skipped."
+            echo "rehearse=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "rehearse=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        if: steps.inputs.outputs.rehearse == 'true'
+        with:
+          go-version-file: .go-release-version
+          cache: true
+      # goreleaser shells out to syft for the SBOMs. make release-validate
+      # fetches the same pinned, checksummed syft that make release does in
+      # the signing job, with scripts/install-syft.sh.
+      - name: build and verify unsigned release artifacts
+        if: steps.inputs.outputs.rehearse == 'true'
+        run: make release-validate
+
+  # Branch protection requires a context named CI, and GitHub publishes one per
+  # job, not per workflow. A skipped required check satisfies protection, so a
+  # bare needs would pass here.
+  # The release tag check's checkout, run on every pull request. The release
+  # dispatch can't run before a release, so this is where its checkout is
+  # proven: it has to hold every branch and tag the step reads, and no token.
+  # internal/repocheck holds the two checkouts' settings equal.
+  release-checkout:
+    name: release checkout
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: the checkout holds every branch and tag, and keeps no token
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=Release checkout::$*"; exit 1; }
+
+          # main, as the remote has it now. A push to main between the checkout
+          # and this call fails the job; rerun it.
+          remote_main="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)"
+          local_main="$(git rev-parse --verify --quiet refs/remotes/origin/main)" ||
+            fail "refs/remotes/origin/main is missing"
+          [ "$local_main" = "$remote_main" ] ||
+            fail "origin/main is $local_main, but the remote's main is $remote_main"
+
+          # Every branch the remote has, so a release-v*.x branch is there too.
+          remote_branches="$(gh api --paginate "repos/$GITHUB_REPOSITORY/branches?per_page=100" --jq '.[].name' | sort)"
+          local_branches="$(git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin | grep -vx HEAD | sort)"
+          missing="$(comm -23 <(printf '%s\n' "$remote_branches") <(printf '%s\n' "$local_branches"))"
+          [ -z "$missing" ] || fail "branches the checkout didn't fetch: $(tr '\n' ' ' <<< "$missing")"
+
+          # Every tag.
+          remote_tags="$(gh api --paginate "repos/$GITHUB_REPOSITORY/tags?per_page=100" --jq '.[].name' | sort)"
+          local_tags="$(git tag -l | sort)"
+          missing="$(comm -23 <(printf '%s\n' "$remote_tags") <(printf '%s\n' "$local_tags"))"
+          [ -z "$missing" ] || fail "tags the checkout didn't fetch: $(tr '\n' ' ' <<< "$missing")"
+
+          # No credential left behind in this checkout's config: no auth header, no
+          # included config, no helper.
+          header="$(git config --local --get-all http.https://github.com/.extraheader || true)"
+          [ -z "$header" ] || fail "the checkout left an http.extraheader in .git/config"
+          included="$(git config --local --name-only --get-regexp '^includeif\.' || true)"
+          [ -z "$included" ] || fail "the checkout left includeIf config: $included"
+          helper="$(git config --local --get-all credential.helper || true)"
+          [ -z "$helper" ] || fail "the checkout left a credential helper"
+          if grep -qi 'authorization' .git/config; then fail ".git/config holds an authorization line"; fi
+          echo "origin/main is $local_main; $(wc -l <<< "$local_branches") branches and $(git tag -l | wc -l) tags fetched; no token kept"
+
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: always()
+    needs:
+      - tracked-ignored
+      - hygiene
+      - public-text
+      - secrets
+      - build
+      - test
+      - testacc
+      - testacc-opentofu
+      - lint
+      - vulncheck
+      - docs
+      - against-fake
+      - plan-quality
+      - upgrade
+      - release-validation
+      - release-checkout
+    steps:
+      - name: require every job to have succeeded
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$JOB_RESULTS"
+          not_ok=$(printf '%s' "$JOB_RESULTS" |
+            jq -r 'to_entries[] | select(.value.result != "success") | "\(.key)=\(.value.result)"')
+          if [ -n "$not_ok" ]; then
+            echo "::error title=CI did not pass::$(printf '%s' "$not_ok" | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "all jobs succeeded"

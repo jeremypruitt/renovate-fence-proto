@@ -1,0 +1,16 @@
+# Shows that a pull request the app opens starts CI, which one opened with
+# GITHUB_TOKEN wouldn't.
+name: pr check
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: who opened it
+        env:
+          ACTOR: ${{ github.actor }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: echo "pull request by $ACTOR from $HEAD_REF"

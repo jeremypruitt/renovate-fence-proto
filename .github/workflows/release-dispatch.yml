@@ -1,0 +1,335 @@
+name: Dispatch signed provider release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-release-tag:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    # Read-only. pull-requests: read lets the release-branch check ask which
+    # pull request merged each commit.
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      tag: ${{ steps.validate.outputs.tag }}
+      tag_commit: ${{ steps.validate.outputs.tag_commit }}
+    steps:
+      # fetch-depth: 0 fetches every branch into refs/remotes/origin and every
+      # tag, so the step below reads main, the release branch and the tag from
+      # here and fetches nothing. The token doesn't have to stay in .git/config.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - id: validate
+        name: Validate SemVer tag and protected-branch ancestry
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          ALLOW_MAJOR: ${{ inputs.allow_major && '1' || '0' }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error title=Dispatcher must run from main::Start this workflow from the default branch."
+            exit 1
+          fi
+
+          numeric_identifier='(0|[1-9][0-9]*)'
+          non_numeric_identifier='[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*'
+          prerelease_identifier="(${numeric_identifier}|${non_numeric_identifier})"
+          semver_regex="^v${numeric_identifier}\\.${numeric_identifier}\\.${numeric_identifier}(-${prerelease_identifier}(\\.${prerelease_identifier})*)?$"
+
+          if [[ ! "$RELEASE_TAG" =~ $semver_regex ]]; then
+            echo "::error title=Invalid release tag::Expected vMAJOR.MINOR.PATCH, optionally followed by a SemVer prerelease. Build metadata is not accepted."
+            exit 1
+          fi
+
+          if ! tag_commit="$(git rev-parse --verify --quiet "refs/tags/${RELEASE_TAG}^{commit}")"; then
+            echo "::error title=Release tag not found::$RELEASE_TAG isn't a tag in this repository. Push the tag before dispatching."
+            exit 1
+          fi
+          # A tag is built from main's own history, or from its own minor's
+          # release branch: v0.1.0-rc.2 and v0.1.1 from release-v0.1.x.
+          # Reachable isn't reviewed. Both branches take merge commits, so every
+          # commit on a merged branch is reachable, including one a later commit
+          # on that branch undid before review saw the result. A release is
+          # built only from a branch's own first-parent history: a merge, or a
+          # commit made on it. Release branches never merge back into main, so
+          # a tag that is reachable from main but not on its own history takes
+          # the release-branch path below and has to pass it.
+          # Whether commit $1 is on ref $2's own history. rev-list's output is
+          # taken whole before grep looks at it. Piped, grep would stop at the
+          # first match, rev-list would die of SIGPIPE, and pipefail would
+          # turn the match into a failure.
+          on_own_history() {
+            local history
+            history="$(git rev-list --first-parent "$2")"
+            grep -qxF "$1" <<< "$history"
+          }
+          if ! on_own_history "$tag_commit" origin/main; then
+            [[ "$RELEASE_TAG" =~ ^v([0-9]+)\.([0-9]+)\. ]]
+            release_branch="release-v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.x"
+            if ! git rev-parse --verify --quiet "refs/remotes/origin/$release_branch" >/dev/null ||
+              ! on_own_history "$tag_commit" "origin/$release_branch"; then
+              echo "::error title=Release tag is not a commit of a release branch::$RELEASE_TAG resolves to $tag_commit, which is on the own history of neither origin/main nor origin/$release_branch. Tag a commit made on one of them, such as a pull request's merge."
+              exit 1
+            fi
+
+            # The branch's rules, as GitHub enforces them now. Every one main
+            # has, plus no deletion. A failed or empty answer stops here, since
+            # set -e and the padded match below both fail closed.
+            rules="$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$release_branch")"
+            types=" $(jq -r '[.[].type] | join(" ")' <<< "$rules") "
+            for rule in pull_request required_signatures required_status_checks non_fast_forward deletion; do
+              if [[ "$types" != *" $rule "* ]]; then
+                echo "::error title=Release branch is not protected::$release_branch has no $rule rule. Protect it like main before releasing from it."
+                exit 1
+              fi
+            done
+            approvals="$(jq '[.[] | select(.type == "pull_request") | .parameters.required_approving_review_count // 0] | max' <<< "$rules")"
+            if (( approvals < 1 )); then
+              echo "::error title=Release branch is not protected::$release_branch lets a pull request merge without an approval."
+              exit 1
+            fi
+            if ! jq -e '[.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context] | index("CI")' <<< "$rules" >/dev/null; then
+              echo "::error title=Release branch is not protected::$release_branch doesn't require the CI check."
+              exit 1
+            fi
+
+            # Rules say what GitHub refuses from now on, not how the branch got
+            # its commits. A pull_request rule doesn't stop the push that
+            # creates a branch, so a branch could start with commits nobody
+            # reviewed. The branch has to start from main's own history, and
+            # every commit on its own history since then has to be the merge
+            # of a pull request into it.
+            branch_point="$(git merge-base origin/main "origin/$release_branch")"
+            if ! on_own_history "$branch_point" origin/main; then
+              echo "::error title=Release branch doesn't start from main::$release_branch leaves main at $branch_point, which is not a commit of main's own history."
+              exit 1
+            fi
+            # Each pull request also needs an approval from someone other than
+            # its author, since the rule may have been added, or loosened,
+            # after it merged. The approval has to be of the head that merged:
+            # GitHub keeps an approval through later pushes unless stale
+            # reviews are dismissed, so an approval of an earlier head proves
+            # nothing about what merged.
+            while IFS= read -r commit; do
+              pull="$(gh api "repos/$GITHUB_REPOSITORY/commits/$commit/pulls" \
+                --jq "[.[] | select(.merged_at != null and .base.ref == \"$release_branch\" and .merge_commit_sha == \"$commit\")] | .[0] | if . == null then \"\" else \"\\(.number) \\(.user.login) \\(.head.sha)\" end")"
+              if [[ -z "$pull" ]]; then
+                echo "::error title=Release branch has an unreviewed commit::$commit on $release_branch is not the merge of a pull request into it. Release from a branch that only takes pull requests."
+                exit 1
+              fi
+              read -r number author head <<< "$pull"
+              # Each reviewer's last word on the merged head counts, so an
+              # approval they followed with changes requested doesn't.
+              reviews="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$number/reviews" \
+                --jq ".[] | select(.user.login != \"$author\" and .commit_id == \"$head\" and (.state == \"APPROVED\" or .state == \"CHANGES_REQUESTED\")) | \"\\(.user.login) \\(.state)\"")"
+              approvals="$(awk '{ last[$1] = $2 } END { n = 0; for (u in last) if (last[u] == "APPROVED") n++; print n }' <<< "$reviews")"
+              if (( approvals < 1 )); then
+                echo "::error title=Release branch has an unreviewed commit::$commit on $release_branch merged pull request #$number, whose merged head $head nobody but its author approved."
+                exit 1
+              fi
+            done < <(git rev-list --first-parent "$tag_commit" "^$branch_point")
+          fi
+
+          # A major version is a decision, not a step. The gate prints what is
+          # still open rather than only refusing, because the person holding
+          # the tag is the person who has to answer it. A major counts as
+          # released only once this workflow has published it: not a draft,
+          # and made by this workflow's token rather than by hand. A tag alone
+          # doesn't count, since a mistaken one can never be deleted.
+          published="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select((.draft | not) and .author.login == "github-actions[bot]") | .tag_name')"
+          mapfile -t published_tags <<< "$published"
+          RELEASE_ALLOW_MAJOR="$ALLOW_MAJOR" ./scripts/check-major-release.sh "$RELEASE_TAG" "${published_tags[@]}"
+
+          {
+            echo "tag=$RELEASE_TAG"
+            echo "tag_commit=$tag_commit"
+          } >> "$GITHUB_OUTPUT"
+      # The tagged commit's ci/real-api/record.json has to name all of its
+      # code, not only its fake. main's copy of the check reads the tagged
+      # tree, so the dispatcher still runs only main's code.
+      - name: Check the tagged code ran against the real API
+        shell: bash
+        env:
+          TAG_COMMIT: ${{ steps.validate.outputs.tag_commit }}
+        run: |
+          set -euo pipefail
+          git worktree add --detach "$RUNNER_TEMP/tagged" "$TAG_COMMIT"
+          ./scripts/real-api-check.sh verify-release "$RUNNER_TEMP/tagged"
+
+  build-signed-artifacts:
+    name: Build signed provider artifacts
+    needs: validate-release-tag
+    runs-on: ubuntu-latest
+    # Environment secrets are unavailable until the secret-free validation job
+    # succeeds and required reviewers approve this protected environment.
+    environment: release-signing
+    # goreleaser creates the GitHub Release draft and uploads its files, and
+    # the last step publishes it. Both are writes to the repository's
+    # contents. No other job in any workflow gets more than read.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ needs.validate-release-tag.outputs.tag_commit }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Recreate the validated tag locally
+        env:
+          RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.validate-release-tag.outputs.tag_commit }}
+        run: git tag --force "$RELEASE_TAG" "$RELEASE_COMMIT"
+      - name: Require release secrets
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.TERRAFORM_PROVIDER_GPG_PRIVATE_KEY }}
+          GPG_KEY_FINGERPRINT: ${{ secrets.TERRAFORM_PROVIDER_GPG_KEY_FINGERPRINT }}
+          GPG_PASSPHRASE: ${{ secrets.TERRAFORM_PROVIDER_GPG_PASSPHRASE }}
+        run: |
+          for secret in GPG_PRIVATE_KEY GPG_KEY_FINGERPRINT GPG_PASSPHRASE; do
+            if [ -z "${!secret}" ]; then
+              echo "::error title=Required release secret is not set::$secret must be configured before provider artifacts can be built."
+              exit 1
+            fi
+          done
+      # The file is read from the tag's commit, so a tag records the Go it was
+      # built with. make vulncheck in CI scans the same version.
+      #
+      # No cache. Other jobs on main write the module and build caches, and
+      # Go trusts a build cache entry without rebuilding it, so a restored
+      # cache would let a job that never held this key shape what it signs.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: .go-release-version
+          cache: false
+      # goreleaser shells out to syft for the SBOMs. make release fetches the
+      # pinned release with scripts/install-syft.sh, which checks its checksum:
+      # an SBOM generator that changes underneath a release changes the
+      # release, and it runs beside the signing key.
+      - name: Import the organization signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.TERRAFORM_PROVIDER_GPG_PRIVATE_KEY }}
+          GPG_KEY_FINGERPRINT: ${{ secrets.TERRAFORM_PROVIDER_GPG_KEY_FINGERPRINT }}
+          GPG_PASSPHRASE: ${{ secrets.TERRAFORM_PROVIDER_GPG_PASSPHRASE }}
+        run: |
+          install -d -m 700 "$RUNNER_TEMP/gnupg"
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --homedir "$RUNNER_TEMP/gnupg" --import
+          # umask before the redirect. `> file` then `chmod` creates the file
+          # world-readable for the moment in between.
+          ( umask 077; printf '%s' "$GPG_PASSPHRASE" > "$RUNNER_TEMP/gpg-passphrase" )
+          gpg --batch --homedir "$RUNNER_TEMP/gnupg" --list-secret-keys "$GPG_KEY_FINGERPRINT"
+
+          # registry.terraform.io accepts RSA and DSA and rejects ECC, which is
+          # what `gpg --full-generate-key` offers by default. Without this the
+          # whole release builds, signs, validates and uploads, and the failure
+          # lands on the registry publish, which is the one step that cannot be
+          # undone. Algorithm ids: 1/2/3 RSA, 17 DSA, per gpg's DETAILS file,
+          # where field 4 of a `sec` record is the public-key algorithm. An
+          # unparseable value falls through to the reject branch on purpose:
+          # stopping a release is the safe direction to be wrong in.
+          algo="$(gpg --batch --homedir "$RUNNER_TEMP/gnupg" --with-colons \
+            --list-secret-keys "$GPG_KEY_FINGERPRINT" | awk -F: '$1=="sec"{print $4; exit}')"
+          case "$algo" in
+            1|2|3|17) echo "signing key algorithm $algo is accepted by the registry" ;;
+            *) echo "::error title=Unsupported signing key algorithm::The registry accepts RSA (1, 2, 3) and DSA (17). This key reports $algo." >&2; exit 1 ;;
+          esac
+      - name: Build signed release artifacts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GNUPGHOME: ${{ runner.temp }}/gnupg
+          GPG_KEY_FINGERPRINT: ${{ secrets.TERRAFORM_PROVIDER_GPG_KEY_FINGERPRINT }}
+          GPG_PASSPHRASE_FILE: ${{ runner.temp }}/gpg-passphrase
+        run: make release
+      - name: Validate release artifact layout
+        env:
+          RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}
+          # The validator binds the signature to this fingerprint, so it needs
+          # both the keyring and the key it is checking for.
+          GNUPGHOME: ${{ runner.temp }}/gnupg
+          GPG_KEY_FINGERPRINT: ${{ secrets.TERRAFORM_PROVIDER_GPG_KEY_FINGERPRINT }}
+        run: |
+          EXPECTED_VERSION="${RELEASE_TAG#v}" REQUIRE_SIGNATURE=true \
+            ./scripts/validate-release-artifacts.sh dist
+      - name: Remove the passphrase file
+        if: always()
+        run: rm -f "$RUNNER_TEMP/gpg-passphrase"
+      # The passphrase file going isn't enough: the imported secret key is in
+      # this keyring, and gpg-agent keeps the unlocked key in memory. Signing
+      # and the signature check above are done with both, and nothing after
+      # this point needs them, so neither outlives this step. Always, so a
+      # failed build doesn't leave the key behind for the post-job steps.
+      - name: Remove the signing keyring
+        if: always()
+        run: |
+          if [ -d "$RUNNER_TEMP/gnupg" ]; then
+            gpgconf --homedir "$RUNNER_TEMP/gnupg" --kill all || true
+          fi
+          rm -rf "$RUNNER_TEMP/gnupg"
+      - name: Retain signed artifacts for distribution publishing
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: terraform-provider-k0rdent-${{ needs.validate-release-tag.outputs.tag }}
+          path: dist/*
+          if-no-files-found: error
+      # Validation above read dist/, and the registries read the release. So
+      # before publishing, every file on the draft has to be a dist/ file
+      # with the same SHA-256, and every file the registry needs has to be
+      # on the draft.
+      - name: Check the draft holds the validated files
+        id: draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq ".[] | select(.draft and .tag_name == \"$RELEASE_TAG\")" > "$RUNNER_TEMP/draft.json"
+          count="$(jq -s length "$RUNNER_TEMP/draft.json")"
+          if [ "$count" != 1 ]; then
+            echo "::error title=No single draft release::Expected one draft release for $RELEASE_TAG, found $count."
+            exit 1
+          fi
+          # An asset without a digest reads as null, which --strict refuses.
+          jq -r '.assets[] | "\(.digest | ltrimstr("sha256:"))  \(.name)"' "$RUNNER_TEMP/draft.json" > "$RUNNER_TEMP/draft.sha256"
+          ( cd dist && sha256sum --check --strict "$RUNNER_TEMP/draft.sha256" )
+          for f in dist/*.zip dist/*_SHA256SUMS dist/*_SHA256SUMS.sig dist/*_manifest.json; do
+            [ -f "$f" ] || { echo "::error title=Release file missing::No $f in dist."; exit 1; }
+            grep -qxF "$(basename "$f")" <(jq -r '.assets[].name' "$RUNNER_TEMP/draft.json") ||
+              { echo "::error title=Release file missing::The draft has no $(basename "$f")."; exit 1; }
+          done
+          echo "id=$(jq -r .id "$RUNNER_TEMP/draft.json")" >> "$GITHUB_OUTPUT"
+      # Last, because it can't be undone: the registries read a published
+      # release, and an immutable release's files lock now. GitHub would
+      # otherwise mark it Latest by date, so a candidate, or a patch to an
+      # older minor published after a newer one, would become what
+      # /releases/latest and the repository page point people to. Only a
+      # final version at least as new as every published final one is Latest.
+      # prerelease=false whatever the tag's .goreleaser.yaml says, since
+      # registry.terraform.io ignores a release marked pre-release.
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ steps.draft.outputs.id }}
+          RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          latest=false
+          if [[ "$RELEASE_TAG" != *-* ]]; then
+            # Its own line, so a failed answer stops the step here.
+            published="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              --jq '.[] | select((.draft or .prerelease) | not) | .tag_name')"
+            newest="$(printf '%s\n' "$published" "$RELEASE_TAG" | grep -v -e '-' | sort -V | tail -n 1)"
+            if [[ "$newest" == "$RELEASE_TAG" ]]; then latest=true; fi
+          fi
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=false -F prerelease=false -f make_latest="$latest" --jq .html_url

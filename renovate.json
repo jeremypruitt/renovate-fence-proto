@@ -1,0 +1,198 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "timezone": "UTC",
+  "schedule": [
+    "before 6am on monday"
+  ],
+  "labels": [
+    "dependencies",
+    "no-changelog-needed"
+  ],
+  "minimumReleaseAge": "3 days",
+  "postUpdateOptions": [
+    "gomodTidy"
+  ],
+  "customManagers": [
+    {
+      "description": "ci.yml's acceptance matrices: the older entry, then the newer one",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/ci\\.yml$/"
+      ],
+      "matchStrings": [
+        "\\n\\s+(?<depName>terraform|tofu): \\[\"(?<currentValue>\\d+\\.\\d+\\.\\d+)\", \"\\d+\\.\\d+\\.\\d+\"\\]"
+      ],
+      "depNameTemplate": "{{depName}} (older minor)",
+      "packageNameTemplate": "{{#if (equals depName 'terraform')}}hashicorp/terraform{{else}}opentofu/opentofu{{/if}}",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/ci\\.yml$/"
+      ],
+      "matchStrings": [
+        "\\n\\s+(?<depName>terraform|tofu): \\[\"\\d+\\.\\d+\\.\\d+\", \"(?<currentValue>\\d+\\.\\d+\\.\\d+)\"\\]"
+      ],
+      "depNameTemplate": "{{depName}} (newer minor)",
+      "packageNameTemplate": "{{#if (equals depName 'terraform')}}hashicorp/terraform{{else}}opentofu/opentofu{{/if}}",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^Makefile$/"
+      ],
+      "matchStrings": [
+        "GOLANGCI_LINT_VERSION \\?= (?<currentValue>v\\S+)"
+      ],
+      "depNameTemplate": "golangci-lint",
+      "packageNameTemplate": "golangci/golangci-lint",
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^Makefile$/"
+      ],
+      "matchStrings": [
+        "GORELEASER_VERSION +\\?= (?<currentValue>v\\S+)"
+      ],
+      "depNameTemplate": "goreleaser",
+      "packageNameTemplate": "goreleaser/goreleaser",
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^Makefile$/"
+      ],
+      "matchStrings": [
+        "TFPLUGINDOCS_VERSION +\\?= (?<currentValue>v\\S+)"
+      ],
+      "depNameTemplate": "tfplugindocs",
+      "packageNameTemplate": "hashicorp/terraform-plugin-docs",
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^Makefile$/"
+      ],
+      "matchStrings": [
+        "GOVULNCHECK_VERSION +\\?= (?<currentValue>v\\S+)"
+      ],
+      "depNameTemplate": "govulncheck",
+      "packageNameTemplate": "golang.org/x/vuln",
+      "datasourceTemplate": "go"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^scripts/install-syft\\.sh$/"
+      ],
+      "matchStrings": [
+        "SYFT_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "syft",
+      "packageNameTemplate": "anchore/syft",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "description": "The Go that builds releases",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.go-release-version$/"
+      ],
+      "matchStrings": [
+        "^(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "go (release builds)",
+      "packageNameTemplate": "go",
+      "datasourceTemplate": "golang-version"
+    }
+  ],
+  "packageRules": [
+    {
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "github.com/hashicorp/terraform-plugin-*"
+      ],
+      "groupName": "terraform-plugin modules"
+    },
+    {
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDepTypes": [
+        "action"
+      ],
+      "groupName": "GitHub Actions"
+    },
+    {
+      "matchPackageNames": [
+        "hashicorp/terraform",
+        "opentofu/opentofu"
+      ],
+      "groupName": "Terraform and OpenTofu releases"
+    },
+    {
+      "description": "setup-terraform and setup-opentofu pins have no v, like the releases' version numbers",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchPackageNames": [
+        "hashicorp/terraform",
+        "opentofu/opentofu"
+      ],
+      "extractVersion": "^v(?<version>.*)$"
+    },
+    {
+      "description": "The older matrix entry only takes patches; a new minor moves the newer one",
+      "matchDepNames": [
+        "terraform (older minor)",
+        "tofu (older minor)"
+      ],
+      "separateMinorPatch": true
+    },
+    {
+      "matchDepNames": [
+        "terraform (older minor)",
+        "tofu (older minor)"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "major"
+      ],
+      "enabled": false
+    },
+    {
+      "matchPackageNames": [
+        "golangci/golangci-lint",
+        "goreleaser/goreleaser",
+        "hashicorp/terraform-plugin-docs",
+        "golang.org/x/vuln",
+        "anchore/syft"
+      ],
+      "groupName": "build tools"
+    },
+    {
+      "matchDepNames": [
+        "go (release builds)"
+      ],
+      "groupName": "build tools"
+    }
+  ],
+  "major": {
+    "dependencyDashboardApproval": true
+  }
+}

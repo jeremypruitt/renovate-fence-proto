@@ -1,0 +1,117 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - copyloopvar
+    - durationcheck
+    - errcheck
+    - forbidigo
+    - govet
+    - ineffassign
+    - makezero
+    - misspell
+    - nilerr
+    - nolintlint
+    - paralleltest
+    - staticcheck
+    - unconvert
+    - unused
+    - usetesting
+
+  settings:
+    # The generated client in internal/k0rdent holds only the operations the
+    # provider calls, all of them public, so a request built by hand is the
+    # only way this provider could reach any other operation. Every request
+    # goes through that client. transport.go is exempt. logging.go, retry.go
+    # and the client's own auth.go may call RoundTrip on the next transport,
+    # because each passes on a request the generated client built. Calling Do on the generated client's own doer
+    # is refused too. A struct that embeds *http.Client and calls Do isn't
+    # caught: forbidigo names that call by the embedding type.
+    # TestNothingWidensTheHandBuiltRequestRule fails on a nolint directive that
+    # would silence this rule, on a file under internal/ that lint would skip
+    # as generated, and on any change to these patterns or exemptions.
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - pattern: ^http\.(NewRequest|NewRequestWithContext|Get|Head|Post|PostForm|DefaultClient)$
+          msg: send requests through the generated k0rdent client, not by hand
+        - pattern: ^http\.Client\.(Do|Get|Head|Post|PostForm)$
+          msg: send requests through the generated k0rdent client, not by hand
+        - pattern: ^http\.(RoundTripper|Transport)\.RoundTrip$
+          msg: send requests through the generated k0rdent client, not by hand
+        - pattern: ^k0rdent\.HttpRequestDoer\.Do$
+          msg: send requests through the generated k0rdent client's operations, not its doer
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+    staticcheck:
+      checks:
+        - all
+    # The acceptance suite shares one fake, so a test runs beside the others
+    # unless it says why it can't. Subtests stay as each test wants them.
+    paralleltest:
+      ignore-missing-subtests: true
+    # For internal/acceptance only, so a nolint:paralleltest gives its reason.
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - std-error-handling
+    rules:
+      # The rule guards what the provider binary sends. Tests drive the fake
+      # control plane directly, and code outside internal/ isn't the provider.
+      - linters: [forbidigo]
+        path: (_test\.go$|^internal/provider/transport\.go$)
+      - linters: [forbidigo]
+        path: ^internal/provider/(logging|retry)\.go$
+        text: RoundTrip
+      - linters: [forbidigo]
+        path: ^internal/k0rdent/auth\.go$
+        text: RoundTrip
+      # The kubeconfig relay sends on what a kubernetes provider or kubectl
+      # sent it, to the cluster's own API with the cluster's token. It never
+      # reaches the platform's API.
+      - linters: [forbidigo]
+        path: ^internal/provider/kubeconfig_relay\.go$
+        text: RoundTrip
+      # The client's tests are copied from k0rdent-clients, which lints them
+      # under its own configuration.
+      - linters: [durationcheck, errcheck, govet, unconvert]
+        path: ^internal/k0rdent/.*_test\.go$
+      - linters: [forbidigo]
+        path-except: ^internal/
+      - linters: [paralleltest]
+        path-except: ^internal/acceptance/
+      # It waits out the built provider's two-minute provisional window, so
+      # it stays serial until that window is cut for the suite.
+      - linters: [paralleltest]
+        path: ^internal/acceptance/
+        text: ^Function TestAccAFailedClusterPlansAnUpdateThatWaitsForIt missing
+      # It counts every create the fake serves to every test.
+      - linters: [paralleltest]
+        path: ^internal/acceptance/
+        text: ^Function TestAccADestroyRunsPastACreateThePlatformFailed missing
+      - linters: [nolintlint]
+        path-except: ^internal/acceptance/
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/k0rdent/terraform-provider-k0rdent
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
