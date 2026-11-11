@@ -29,6 +29,7 @@ jobs:
           permission-pull-requests: write
           permission-workflows: write
           permission-issues: write
+          permission-statuses: write
       - name: renovate
         env:
           RENOVATE_TOKEN: ${{ steps.app.outputs.token }}
