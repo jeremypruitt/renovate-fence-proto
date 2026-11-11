@@ -21,10 +21,10 @@ BINARY  := terraform-provider-$(PROVIDER_NAME)
 OS_ARCH := $(shell go env GOOS)_$(shell go env GOARCH)
 LDFLAGS := -ldflags "-X main.version=$(VERSION)"
 
-GOLANGCI_LINT_VERSION ?= v2.13.2
-GORELEASER_VERSION    ?= v2.18.2
+GOLANGCI_LINT_VERSION ?= v2.15.0
+GORELEASER_VERSION    ?= v2.20.0
 TFPLUGINDOCS_VERSION  ?= v0.25.0
-GOVULNCHECK_VERSION   ?= v1.8.0
+GOVULNCHECK_VERSION   ?= v1.9.0
 
 # The Go the signed release is built with. release-dispatch.yml, the docs job
 # and the release rehearsal in ci.yml read the same file through setup-go's
